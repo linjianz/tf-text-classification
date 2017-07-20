@@ -14,18 +14,20 @@ import re
 from tensorflow.contrib import learn
 
 
-dir0 = '20170720'    # change it every time when training
+dir0 = '20170720_1'    # change it every time when training
 lr_base = 1e-3          # 初始学习率
 epoch_max = 200         # 最大epoch次数
 epoch_save = 20         # 每#epoch保存一次模型
 max_to_keep = 3         # 最多保存模型数目
 batch_size = 64         # batch size
 embedding_size = 128    # 词向量维度
+hidden_size = 128       # lstm隐层单元个数
+num_layer = 1           # lstm层数
 ########################################
 data_file1 = 'data/rt-polaritydata/rt-polarity.pos'
 data_file2 = 'data/rt-polaritydata/rt-polarity.neg'
 # dir_restore = 'model/cnn_vo/20170705_1/model-30200'
-net_name = 'cnn/'
+net_name = 'c_lstm/'
 dir_models = 'model/' + net_name
 dir_logs = 'log/' + net_name
 dir_model = dir_models + dir0
@@ -127,26 +129,39 @@ class Data(object):
 
 
 class Net(object):
-    def __init__(self, sequence_length, num_class, vocabulary_size):
+    def __init__(self, sequence_length, num_class, vocabulary_size, embedding_size):
         self.x1 = tf.placeholder(tf.int32, [None, sequence_length], name='x1')  # sentence
         self.x2 = tf.placeholder(tf.int32, [None, num_class], name='x2')  # label
         self.x3 = tf.placeholder(tf.float32, [], name='x3')  # lr
         self.x4 = tf.placeholder(tf.float32, [], name='x4')  # dropout
+        self.x5 = tf.placeholder(tf.int32, [], name='x5')  # batch size
+
         with tf.variable_scope('embedding'):
             self.w_embed = tf.Variable(tf.random_uniform([vocabulary_size, embedding_size], -1.0, 1.0), name='w_embed')
             self.embed = tf.nn.embedding_lookup(self.w_embed, self.x1)  # [bs, 57, 128]
             self.embed_expanded = tf.expand_dims(self.embed, -1)  # [bs, 57, 128, 1]
 
         with tf.variable_scope('conv'):
-            conv1_1 = slim.conv2d(self.embed_expanded, 128, [3, embedding_size], 1, padding='valid', scope='conv1_1')  # [bs, 55, 1, 128]
-            pool1_1 = slim.max_pool2d(conv1_1, [sequence_length - 3 + 1, 1], 1, scope='pool1_1')  # [bs, 1, 1, 128]
-            conv1_2 = slim.conv2d(self.embed_expanded, 128, [4, embedding_size], 1, padding='valid', scope='conv1_2')
-            pool1_2 = slim.max_pool2d(conv1_2, [sequence_length - 4 + 1, 1], 1, scope='pool1_2')
-            conv1_3 = slim.conv2d(self.embed_expanded, 128, [5, embedding_size], 1, padding='valid', scope='conv1_3')
-            pool1_3 = slim.max_pool2d(conv1_3, [sequence_length - 5 + 1, 1], 1, scope='pool1_3')
-        pool1 = tf.concat([pool1_1, pool1_2, pool1_3], axis=3, name='pool1')  # [bs, 1, 1, 384]
-        pool1_flat = tf.reshape(pool1, [-1, 384], name='pool1_flat')
-        dropout1 = slim.dropout(pool1_flat, self.x4, scope='dropout1')
+            conv1 = slim.conv2d(self.embed_expanded, 128, [3, embedding_size], 1, padding='valid', scope='conv1')
+            # conv1 [bs, 55, 1, 128]
+            inputs = tf.squeeze(conv1, axis=2)  # [bs, 55, 128]
+        # lstm
+        with tf.variable_scope('lstm_cell'):
+            cell = tf.nn.rnn_cell.BasicLSTMCell(hidden_size, forget_bias=0.0, state_is_tuple=True)
+            cell = tf.nn.rnn_cell.DropoutWrapper(cell, output_keep_prob=self.x4)  # dropout
+            cell = tf.nn.rnn_cell.MultiRNNCell([cell] * num_layer, state_is_tuple=True)
+            self._initial_state = cell.zero_state(self.x5, dtype=tf.float32)
+        shp = inputs.get_shape()
+        outputs = []
+        state = self._initial_state
+        with tf.variable_scope('lstm_layer'):
+            for time_step in range(shp[1].value):
+                if time_step > 0:
+                    tf.get_variable_scope().reuse_variables()
+                (cell_output, state) = cell(inputs[:, :, time_step], state)  # cell_output [bs, 128]
+                outputs.append(cell_output)
+        output = outputs[-1]
+        dropout1 = slim.dropout(output, self.x4, scope='dropout1')
         with tf.variable_scope('softmax'):
             self.fc2 = slim.fully_connected(dropout1, num_class, activation_fn=None, scope='fc2')
 
@@ -185,7 +200,8 @@ def main(_):
     # 3. 定义graph
     model = Net(sequence_length=data_t.shape[1],
                 num_class=label_t.shape[1],
-                vocabulary_size=len(vocab_processor.vocabulary_))
+                vocabulary_size=len(vocab_processor.vocabulary_),
+                embedding_size=embedding_size)
 
     with tf.Session(config=model.tf_config) as sess:
         writer_train = tf.summary.FileWriter(dir_log_train, sess.graph)
@@ -202,6 +218,7 @@ def main(_):
                 feed_dict_t[model.x2] = x2_t
                 feed_dict_t[model.x3] = lr
                 feed_dict_t[model.x4] = 0.5
+                feed_dict_t[model.x5] = batch_size
                 sess.run(model.train_op, feed_dict_t)
                 # display
                 if not (iteration + 1) % 10:
@@ -214,6 +231,7 @@ def main(_):
                     feed_dict_v[model.x1] = data_v
                     feed_dict_v[model.x2] = label_v
                     feed_dict_v[model.x4] = 1.0
+                    feed_dict_v[model.x5] = data_v.shape[0]
                     summary_out_v, loss_out_v, acc_out_v = sess.run([model.summary_merge, model.loss, model.accuracy], feed_dict_v)
                     writer_val.add_summary(summary_out_v, global_iter + 1)
                     print('****val loss: %.5f, accuracy: %.5f****' % (loss_out_v, acc_out_v))

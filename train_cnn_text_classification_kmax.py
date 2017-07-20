@@ -21,11 +21,12 @@ epoch_save = 20         # 每#epoch保存一次模型
 max_to_keep = 3         # 最多保存模型数目
 batch_size = 64         # batch size
 embedding_size = 128    # 词向量维度
+k_max = 6               # max-pooling时取#个最大值
 ########################################
 data_file1 = 'data/rt-polaritydata/rt-polarity.pos'
 data_file2 = 'data/rt-polaritydata/rt-polarity.neg'
 # dir_restore = 'model/cnn_vo/20170705_1/model-30200'
-net_name = 'cnn/'
+net_name = 'cnn_kmax/'
 dir_models = 'model/' + net_name
 dir_logs = 'log/' + net_name
 dir_model = dir_models + dir0
@@ -127,11 +128,12 @@ class Data(object):
 
 
 class Net(object):
-    def __init__(self, sequence_length, num_class, vocabulary_size):
+    def __init__(self, sequence_length, num_class, vocabulary_size, k_max):
         self.x1 = tf.placeholder(tf.int32, [None, sequence_length], name='x1')  # sentence
         self.x2 = tf.placeholder(tf.int32, [None, num_class], name='x2')  # label
         self.x3 = tf.placeholder(tf.float32, [], name='x3')  # lr
         self.x4 = tf.placeholder(tf.float32, [], name='x4')  # dropout
+        self.k_max = k_max
         with tf.variable_scope('embedding'):
             self.w_embed = tf.Variable(tf.random_uniform([vocabulary_size, embedding_size], -1.0, 1.0), name='w_embed')
             self.embed = tf.nn.embedding_lookup(self.w_embed, self.x1)  # [bs, 57, 128]
@@ -139,13 +141,16 @@ class Net(object):
 
         with tf.variable_scope('conv'):
             conv1_1 = slim.conv2d(self.embed_expanded, 128, [3, embedding_size], 1, padding='valid', scope='conv1_1')  # [bs, 55, 1, 128]
-            pool1_1 = slim.max_pool2d(conv1_1, [sequence_length - 3 + 1, 1], 1, scope='pool1_1')  # [bs, 1, 1, 128]
+            stride1 = (sequence_length - 3 + 1) // self.k_max
+            pool1_1 = slim.max_pool2d(conv1_1, [stride1, 1], [stride1, 1], scope='pool1_1')  # [bs, 3, 1, 128]
             conv1_2 = slim.conv2d(self.embed_expanded, 128, [4, embedding_size], 1, padding='valid', scope='conv1_2')
-            pool1_2 = slim.max_pool2d(conv1_2, [sequence_length - 4 + 1, 1], 1, scope='pool1_2')
+            stride2 = (sequence_length - 4 + 1) // self.k_max
+            pool1_2 = slim.max_pool2d(conv1_2, [stride2, 1], [stride2, 1], scope='pool1_2')
             conv1_3 = slim.conv2d(self.embed_expanded, 128, [5, embedding_size], 1, padding='valid', scope='conv1_3')
-            pool1_3 = slim.max_pool2d(conv1_3, [sequence_length - 5 + 1, 1], 1, scope='pool1_3')
-        pool1 = tf.concat([pool1_1, pool1_2, pool1_3], axis=3, name='pool1')  # [bs, 1, 1, 384]
-        pool1_flat = tf.reshape(pool1, [-1, 384], name='pool1_flat')
+            stride3 = (sequence_length - 5 + 1) // self.k_max
+            pool1_3 = slim.max_pool2d(conv1_3, [stride3, 1], [stride3, 1], scope='pool1_3')
+        pool1 = tf.concat([pool1_1, pool1_2, pool1_3], axis=3, name='pool1')  # [bs, 3, 1, 384]
+        pool1_flat = tf.reshape(pool1, [-1, self.k_max * 384], name='pool1_flat')
         dropout1 = slim.dropout(pool1_flat, self.x4, scope='dropout1')
         with tf.variable_scope('softmax'):
             self.fc2 = slim.fully_connected(dropout1, num_class, activation_fn=None, scope='fc2')
@@ -185,7 +190,8 @@ def main(_):
     # 3. 定义graph
     model = Net(sequence_length=data_t.shape[1],
                 num_class=label_t.shape[1],
-                vocabulary_size=len(vocab_processor.vocabulary_))
+                vocabulary_size=len(vocab_processor.vocabulary_),
+                k_max=k_max)
 
     with tf.Session(config=model.tf_config) as sess:
         writer_train = tf.summary.FileWriter(dir_log_train, sess.graph)

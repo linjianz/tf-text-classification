@@ -14,7 +14,7 @@ import re
 from tensorflow.contrib import learn
 
 
-dir0 = '20170720_2'    # change it every time when training
+dir0 = '20170720'    # change it every time when training
 lr_base = 1e-3          # 初始学习率
 epoch_max = 200         # 最大epoch次数
 epoch_save = 20         # 每#epoch保存一次模型
