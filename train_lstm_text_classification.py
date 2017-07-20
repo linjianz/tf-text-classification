@@ -21,11 +21,13 @@ epoch_save = 20         # 每#epoch保存一次模型
 max_to_keep = 3         # 最多保存模型数目
 batch_size = 64         # batch size
 embedding_size = 128    # 词向量维度
+hidden_size = 128       # lstm隐层单元个数
+num_layer = 2           # lstm层数
 ########################################
 data_file1 = 'data/rt-polaritydata/rt-polarity.pos'
 data_file2 = 'data/rt-polaritydata/rt-polarity.neg'
-# dir_restore = 'model/cnn_vo/20170705_1/model-30200'
-net_name = 'cnn/'
+# dir_restore = 'model/cnn/20170705_1/model-30200'
+net_name = 'lstm/'
 dir_models = 'model/' + net_name
 dir_logs = 'log/' + net_name
 dir_model = dir_models + dir0
@@ -45,7 +47,7 @@ if os.path.exists(dir_log_val):
 os.mkdir(dir_model)
 os.mkdir(dir_log_train)
 os.mkdir(dir_log_val)
-# ########################################
+########################################
 
 
 def clean_str(string):
@@ -98,16 +100,21 @@ def load_data(file1, file2):
     label_t = np.concatenate([label1[:number_train_pos], label2[:number_train_pos]], 0)
     data_v = np.concatenate([data_pos[number_train_pos:], data_neg[number_train_pos:]], 0)
     label_v = np.concatenate([label1[number_train_pos:], label2[number_train_pos:]], 0)
-    return data_t, label_t, data_v, label_v, vocab_processor
+
+    # Generate mask  [57, sample_number]
+    mask_t = (np.array(data_t) > 0).astype(int).transpose([1, 0])
+    mask_v = (np.array(data_v) > 0).astype(int).transpose([1, 0])
+    return data_t, label_t, mask_t, data_v, label_v, mask_v, vocab_processor
 
 
 class Data(object):
-    def __init__(self, data, label, bs=batch_size, shuffle=True):
+    def __init__(self, data, label, mask, bs=batch_size, shuffle=True):
         self.data = data
         self.label = label
+        self.mask = mask
         self.bs = bs
         self.shuffle = shuffle
-        self.index = 0              # point at total_index
+        self.index = 0  # point at total_index
         self.number = len(label)
         self.total_index = range(self.number)
         if self.shuffle:
@@ -123,39 +130,51 @@ class Data(object):
             start = self.index
             self.index += self.bs
         end = self.index
-        return self.data[self.total_index[start:end]], self.label[self.total_index[start:end]]
+        return_x1 = self.data[self.total_index[start:end]]
+        return_x2 = self.label[self.total_index[start:end]]
+        return_x3 = self.mask[:, self.total_index[start:end]]
+        return return_x1, return_x2, return_x3
 
 
 class Net(object):
-    def __init__(self, sequence_length, num_class, vocabulary_size):
+    def __init__(self, sequence_length, num_class, vocabulary_size, hidden_size, num_layer):
         self.x1 = tf.placeholder(tf.int32, [None, sequence_length], name='x1')  # sentence
         self.x2 = tf.placeholder(tf.int32, [None, num_class], name='x2')  # label
-        self.x3 = tf.placeholder(tf.float32, [], name='x3')  # lr
-        self.x4 = tf.placeholder(tf.float32, [], name='x4')  # dropout
+        self.x3 = tf.placeholder(tf.float32, [sequence_length, None], name='x3')  # mask
+        self.x4 = tf.placeholder(tf.float32, [], name='x4')  # lr
+        self.x5 = tf.placeholder(tf.float32, [], name='x5')  # dropout
+        self.x6 = tf.placeholder(tf.int32, [], name='x6')  # batch size
         with tf.variable_scope('embedding'):
             self.w_embed = tf.Variable(tf.random_uniform([vocabulary_size, embedding_size], -1.0, 1.0), name='w_embed')
-            self.embed = tf.nn.embedding_lookup(self.w_embed, self.x1)  # [bs, 57, 128]
-            self.embed_expanded = tf.expand_dims(self.embed, -1)  # [bs, 57, 128, 1]
-
-        with tf.variable_scope('conv'):
-            conv1_1 = slim.conv2d(self.embed_expanded, 128, [3, embedding_size], 1, padding='valid', scope='conv1_1')  # [bs, 55, 1, 128]
-            pool1_1 = slim.max_pool2d(conv1_1, [sequence_length - 3 + 1, 1], 1, scope='pool1_1')  # [bs, 1, 1, 128]
-            conv1_2 = slim.conv2d(self.embed_expanded, 128, [4, embedding_size], 1, padding='valid', scope='conv1_2')
-            pool1_2 = slim.max_pool2d(conv1_2, [sequence_length - 4 + 1, 1], 1, scope='pool1_2')
-            conv1_3 = slim.conv2d(self.embed_expanded, 128, [5, embedding_size], 1, padding='valid', scope='conv1_3')
-            pool1_3 = slim.max_pool2d(conv1_3, [sequence_length - 5 + 1, 1], 1, scope='pool1_3')
-        pool1 = tf.concat([pool1_1, pool1_2, pool1_3], axis=3, name='pool1')  # [bs, 1, 1, 384]
-        pool1_flat = tf.reshape(pool1, [-1, 384], name='pool1_flat')
-        dropout1 = slim.dropout(pool1_flat, self.x4, scope='dropout1')
+            embed = tf.nn.embedding_lookup(self.w_embed, self.x1)  # [bs, 57, 128]
+            self.inputs = tf.nn.dropout(embed, self.x5)
+        # lstm
+        with tf.variable_scope('lstm_cell'):
+            cell = tf.nn.rnn_cell.BasicLSTMCell(hidden_size, forget_bias=0.0, state_is_tuple=True)
+            cell = tf.nn.rnn_cell.DropoutWrapper(cell, output_keep_prob=self.x5)  # dropout
+            cell = tf.nn.rnn_cell.MultiRNNCell([cell] * num_layer, state_is_tuple=True)
+            self._initial_state = cell.zero_state(self.x6, dtype=tf.float32)
+        output = []
+        state = self._initial_state
+        with tf.variable_scope('lstm_layer'):
+            for time_step in range(sequence_length):
+                if time_step > 0:
+                    tf.get_variable_scope().reuse_variables()
+                (cell_output, state) = cell(self.inputs[:, time_step, :], state)
+                output.append(cell_output)  # [57, 64, 128]
+        output = output * self.x3[:, :, None]  # [57, 64, 128]
+        # 输出要用mask屏蔽掉padding部分，也就是直接将原句中padding为零的的地方同样作用于输出
+        with tf.name_scope("mean_pooling_layer"):
+            output = tf.reduce_sum(output, 0)/(tf.reduce_sum(self.x3, 0)[:, None])  # [64, 128] 沿时间轴做mean-pooling
         with tf.variable_scope('softmax'):
-            self.fc2 = slim.fully_connected(dropout1, num_class, activation_fn=None, scope='fc2')
+            self.fc = slim.fully_connected(output, num_class, activation_fn=None, scope='fc')
 
         # loss & accuracy
-        losses = tf.nn.softmax_cross_entropy_with_logits(logits=self.fc2, labels=self.x2, name='loss')
+        losses = tf.nn.softmax_cross_entropy_with_logits(logits=self.fc, labels=self.x2, name='loss')
         self.loss = tf.reduce_mean(losses)  # 不能少！取均值
-        optimizer = tf.train.AdamOptimizer(self.x3)
+        optimizer = tf.train.AdamOptimizer(self.x4)
         self.train_op = slim.learning.create_train_op(self.loss, optimizer)
-        self.prediction = tf.argmax(self.fc2, 1, name='prediction')
+        self.prediction = tf.argmax(self.fc, 1, name='prediction')
         correct_prediction = tf.equal(self.prediction, tf.argmax(self.x2, 1))
         self.accuracy = tf.reduce_mean(tf.cast(correct_prediction, 'float'), name='accuracy')
 
@@ -179,13 +198,15 @@ class Net(object):
 
 def main(_):
     # 1. 载入数据。将数据处理成网络需要的格式
-    data_t, label_t, data_v, label_v, vocab_processor = load_data(data_file1, data_file2)
+    data_t, label_t, mask_t, data_v, label_v, mask_v, vocab_processor = load_data(data_file1, data_file2)
     # 2. 数据初始化及产生mini-batch数据
-    model_data_t = Data(data_t, label_t)
+    model_data_t = Data(data_t, label_t, mask_t)
     # 3. 定义graph
     model = Net(sequence_length=data_t.shape[1],
                 num_class=label_t.shape[1],
-                vocabulary_size=len(vocab_processor.vocabulary_))
+                vocabulary_size=len(vocab_processor.vocabulary_),
+                hidden_size=hidden_size,
+                num_layer=num_layer)
 
     with tf.Session(config=model.tf_config) as sess:
         writer_train = tf.summary.FileWriter(dir_log_train, sess.graph)
@@ -196,25 +217,32 @@ def main(_):
             iter_per_epoch = len(label_t) // batch_size
             for iteration in range(iter_per_epoch):
                 global_iter = epoch * iter_per_epoch + iteration
-                x1_t, x2_t = model_data_t.next_batch()
+                x1_t, x2_t, x3_t = model_data_t.next_batch()
                 feed_dict_t = dict()
                 feed_dict_t[model.x1] = x1_t
                 feed_dict_t[model.x2] = x2_t
-                feed_dict_t[model.x3] = lr
-                feed_dict_t[model.x4] = 0.5
+                feed_dict_t[model.x3] = x3_t
+                feed_dict_t[model.x4] = lr
+                feed_dict_t[model.x5] = 0.5
+                feed_dict_t[model.x6] = batch_size
                 sess.run(model.train_op, feed_dict_t)
                 # display
                 if not (iteration + 1) % 10:
-                    summary_out_t, loss_out_t, acc_out_t = sess.run([model.summary_merge, model.loss, model.accuracy], feed_dict_t)
+                    summary_out_t, loss_out_t, acc_out_t = sess.run([model.summary_merge, model.loss, model.accuracy],
+                                                                    feed_dict_t)
                     writer_train.add_summary(summary_out_t, global_iter + 1)
                     print('%s, epoch %03d/%03d, iter %04d/%04d, lr %.5f, loss: %.5f, accuracy: %.5f' %
-                          (datetime.now(), epoch + 1, epoch_max, iteration + 1, iter_per_epoch, lr, loss_out_t, acc_out_t))
+                          (datetime.now(), epoch + 1, epoch_max, iteration + 1, iter_per_epoch, lr, loss_out_t,
+                           acc_out_t))
                 if not (iteration + 1) % 100:
                     feed_dict_v = dict()
                     feed_dict_v[model.x1] = data_v
                     feed_dict_v[model.x2] = label_v
-                    feed_dict_v[model.x4] = 1.0
-                    summary_out_v, loss_out_v, acc_out_v = sess.run([model.summary_merge, model.loss, model.accuracy], feed_dict_v)
+                    feed_dict_v[model.x3] = mask_v
+                    feed_dict_v[model.x5] = 1.0
+                    feed_dict_v[model.x6] = data_v.shape[0]
+                    summary_out_v, loss_out_v, acc_out_v = sess.run([model.summary_merge, model.loss, model.accuracy],
+                                                                    feed_dict_v)
                     writer_val.add_summary(summary_out_v, global_iter + 1)
                     print('****val loss: %.5f, accuracy: %.5f****' % (loss_out_v, acc_out_v))
                 # save
