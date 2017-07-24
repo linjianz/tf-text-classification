@@ -3,3 +3,8 @@ This is an implementation of different methods for text classification with tens
 ## train_cnn_text_classificatioin
 
 ## train_lstm_text_classification
+
+## train_c_lstm_text_classification
+
+## train_fastText
+

@@ -14,15 +14,19 @@ import re
 from tensorflow.contrib import learn
 
 
-dir0 = '20170721_1'    # change it every time when training
-lr_base = 1e-3          # 初始学习率
-epoch_max = 200         # 最大epoch次数
-epoch_save = 20         # 每#epoch保存一次模型
-max_to_keep = 3         # 最多保存模型数目
+dir0 = '20170724_5'    # change it every time when training
+lr_base = 1e-4          # 初始学习率
+epoch_lr_decay = 200    # 每#epoch减小一次学习率
+lr_decay = 0.2          # lr缩小倍数
+epoch_max = 400         # 最大epoch次数
+max_to_keep = 4         # 最多保存模型数目
+epoch_save = epoch_max // max_to_keep
 batch_size = 64         # batch size
 embedding_size = 128    # 词向量维度
 hidden_size = 128       # lstm隐层单元个数
 num_layer = 2           # lstm层数
+l2 = False             # 是否使用正则约束
+dir_restore = 'model/fastText/20170724_3/model-29800'
 ########################################
 data_file1 = 'data/rt-polaritydata/rt-polarity.pos'
 data_file2 = 'data/rt-polaritydata/rt-polarity.neg'
@@ -129,11 +133,16 @@ class Data(object):
 
 
 class Net(object):
-    def __init__(self, sequence_length, num_class, vocabulary_size, hidden_size, num_layer):
+    def __init__(self, sequence_length, num_class, vocabulary_size, l2=False):
         self.x1 = tf.placeholder(tf.int32, [None, sequence_length], name='x1')  # sentence
         self.x2 = tf.placeholder(tf.int32, [None, num_class], name='x2')  # label
         self.lr = tf.placeholder(tf.float32, [], name='lr')  # lr
         self.dp = tf.placeholder(tf.float32, [], name='dp')  # dropout
+        if l2:
+            self.l2 = slim.l2_regularizer(0.0005)
+        else:
+            self.l2 = None
+
         with tf.variable_scope('embedding'):
             self.w_embed = tf.Variable(tf.random_uniform([vocabulary_size, embedding_size], -1.0, 1.0), name='w_embed')
             embed = tf.nn.embedding_lookup(self.w_embed, self.x1)  # [bs, 57, 128]
@@ -141,11 +150,17 @@ class Net(object):
         # average
         sen_vec = tf.reduce_mean(self.inputs, 1)
         with tf.variable_scope('softmax'):
-            self.fc = slim.fully_connected(sen_vec, num_class, activation_fn=None, scope='fc')
+            self.fc = slim.fully_connected(sen_vec, num_class,
+                                           activation_fn=None,
+                                           weights_regularizer=self.l2,
+                                           scope='fc')
 
         # loss & accuracy
         losses = tf.nn.softmax_cross_entropy_with_logits(logits=self.fc, labels=self.x2, name='loss')
-        self.loss = tf.reduce_mean(losses)  # 不能少！取均值
+        self.loss1 = tf.reduce_mean(losses)
+        slim.losses.add_loss(self.loss1)  # 自己定义的loss函数，需要add
+        self.loss = slim.losses.get_total_loss()  # 默认加上l2_loss
+
         optimizer = tf.train.AdamOptimizer(self.lr)
         self.train_op = slim.learning.create_train_op(self.loss, optimizer)
         self.prediction = tf.argmax(self.fc, 1, name='prediction')
@@ -165,7 +180,7 @@ class Net(object):
 
         # gpu configuration
         self.tf_config = tf.ConfigProto()
-        # self.tf_config.gpu_options.allow_growth = True
+        self.tf_config.gpu_options.allow_growth = True
         # if use_gpu_1:
         #     self.tf_config.gpu_options.visible_device_list = '1'
 
@@ -179,15 +194,19 @@ def main(_):
     model = Net(sequence_length=data_t.shape[1],
                 num_class=label_t.shape[1],
                 vocabulary_size=len(vocab_processor.vocabulary_),
-                hidden_size=hidden_size,
-                num_layer=num_layer)
+                l2=l2)
 
     with tf.Session(config=model.tf_config) as sess:
         writer_train = tf.summary.FileWriter(dir_log_train, sess.graph)
         writer_val = tf.summary.FileWriter(dir_log_val, sess.graph)
+        # 1. train from scratch
         sess.run(model.init)
+        # 2. restore from a pre-trained model
+        # model.saver.restore(sess, dir_restore)
+
         for epoch in range(epoch_max):
-            lr = lr_base
+            lr_coefficient = lr_decay ** (epoch // epoch_lr_decay)
+            lr = lr_base * lr_coefficient
             iter_per_epoch = len(label_t) // batch_size
             for iteration in range(iter_per_epoch):
                 global_iter = epoch * iter_per_epoch + iteration
@@ -206,7 +225,7 @@ def main(_):
                     print('%s, epoch %03d/%03d, iter %04d/%04d, lr %.5f, loss: %.5f, accuracy: %.5f' %
                           (datetime.now(), epoch + 1, epoch_max, iteration + 1, iter_per_epoch, lr, loss_out_t,
                            acc_out_t))
-                if not (iteration + 1) % 100:
+                if not (iteration + 1) % 50:
                     feed_dict_v = dict()
                     feed_dict_v[model.x1] = data_v
                     feed_dict_v[model.x2] = label_v
