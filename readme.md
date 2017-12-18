@@ -1,5 +1,5 @@
 # Here we go
-This is an implementation of different methods for text classification with tensorflow  
+This is an implementation of different methods for text classification with tensorflow, all the methods and experiments can be found here [**文本分类实践**](http://note.youdao.com/noteshare?id=9d0a3e6c1769938c3b57399a6ec317ee&sub=7C38D325A9484DB19102054701C9B5EC)
 
 Method|Accuracy|Time(CPU)|Time(GPU)|Summary
 :-:|:-:|:-:|:-:|:-:
